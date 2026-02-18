@@ -76,3 +76,40 @@ Phase 1 완료 후 아래 후보 중 선택하여 진행합니다.
 - GitHub Repository (공통 테스트 코드 + 각자 구현 브랜치)
 - Phase별 기술 문서 (문제 정의 → 해결 → 검증 → 결론)
 - 테스트 결과 비교 리포트
+
+## 로컬 환경 세팅 (goldentree-server 뉴비별점평가 API 기준)
+
+이 스터디의 1차 시나리오는 `goldentree-server`의 신규 가입자 평가 흐름(`POST /card/newbie`)을 단순화해 재현합니다.
+
+- 평가 조회 시 `NEWBIE_EVAL_HIST`에 `score=0`, `end_yn=false` 상태로 평가 카드를 생성
+- 500ms 이내 동일 요청이 중복으로 들어올 때 중복 INSERT 발생 여부를 검증
+- 비교 실험을 위해 **유니크 제약 없이** 운영과 유사한 조건을 유지
+
+### 1) 환경 변수 준비
+
+```bash
+cp .env.example .env
+```
+
+### 2) 전체 기동 (App + MySQL + Redis)
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+- 초기 스키마/샘플 데이터: `docker/mysql/init/01_newbie_eval_schema.sql`
+- 기본 DB: `concurrency_study`
+- 앱 포트: `http://localhost:8080`
+
+### 3) 테스트 API 호출
+
+- 생성 API: `POST /card/newbie`
+
+```bash
+curl -X POST 'http://localhost:8080/card/newbie' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "evalUserNo": 1001
+  }'
+```

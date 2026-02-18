@@ -1,20 +1,74 @@
 spring:
+  application:
+    name: concurrency-study
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  profiles:
+    active: local
   datasource:
-    url: jdbc:mysql://localhost:3306/concurrency_study
-    username: root
-    password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
-
+    hikari:
+      pool-name: concurrency-study-pool
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      maximum-pool-size: ${DB_POOL_MAX_SIZE:10}
+      connection-timeout: 30000
+      idle-timeout: 300000
+      max-lifetime: 540000
+      leak-detection-threshold: 2000
+      connection-test-query: SELECT 1
   jpa:
+    open-in-view: false
     hibernate:
-      ddl-auto: update
-    show-sql: true
+      ddl-auto: none
+      naming:
+        physical-strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl
     properties:
       hibernate:
         format_sql: true
         dialect: org.hibernate.dialect.MySQLDialect
-
+        jdbc:
+          time_zone: Asia/Seoul
   data:
     redis:
+      timeout: 2s
+      connect-timeout: 2s
+
+server:
+  shutdown: graceful
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:concurrency_study}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&characterEncoding=utf8
+    username: ${MYSQL_USERNAME:root}
+    password: ${MYSQL_PASSWORD:root}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+  datasource:
+    url: jdbc:h2:mem:concurrency-study;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_UPPER=false
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  data:
+    redis:
+      repositories:
+        enabled: false
       host: localhost
       port: 6379
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
