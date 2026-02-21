@@ -1,0 +1,425 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Concurrency Study Infrastructure (ap-northeast-2)
+  VPC + ALB + EC2 x2 + RDS MySQL 8.0 + ElastiCache Redis 7
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 SSH 접속용 키 페어 (사전에 EC2 > Key Pairs에서 생성 필요)
+
+  MyIP:
+    Type: String
+    Description: "SSH 접속을 허용할 IP (예: 123.456.789.0/32)"
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: "CIDR 형식으로 입력 (예: 203.0.113.0/32)"
+
+  DBMasterPassword:
+    Type: String
+    Description: RDS MySQL 비밀번호 (8자 이상)
+    NoEcho: true
+    MinLength: 8
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Amazon Linux 2023 최신 AMI (변경 불필요)
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ======================== VPC ========================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: concurrency-study-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: concurrency-study-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ======================== Subnets ========================
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: concurrency-study-public-2a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: concurrency-study-public-2b
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: concurrency-study-private-2a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: concurrency-study-private-2b
+
+  # ======================== Route Tables ========================
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: concurrency-study-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: concurrency-study-private-rt
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ======================== Security Groups ========================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP 80 from Internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: concurrency-study-alb-sg
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 - 8080 from ALB, 22 from MyIP
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+      Tags:
+        - Key: Name
+          Value: concurrency-study-ec2-sg
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - 3306 from EC2 only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: concurrency-study-rds-sg
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis - 6379 from EC2 only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: concurrency-study-redis-sg
+
+  # ======================== ALB ========================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: concurrency-study-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: concurrency-study-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: concurrency-study-tg
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,404"
+      Targets:
+        - Id: !Ref EC2Instance1
+          Port: 8080
+        - Id: !Ref EC2Instance2
+          Port: 8080
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ======================== EC2 ========================
+  EC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: concurrency-study-app-1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker git java-21-amazon-corretto-headless mariadb105
+          systemctl enable docker
+          systemctl start docker
+          usermod -a -G docker ec2-user
+
+          mkdir -p /home/ec2-user/app
+          echo "SPRING_PROFILES_ACTIVE=local" > /home/ec2-user/app/app.env
+          echo "MYSQL_HOST=${RDSInstance.Endpoint.Address}" >> /home/ec2-user/app/app.env
+          echo "MYSQL_PORT=3306" >> /home/ec2-user/app/app.env
+          echo "MYSQL_DATABASE=concurrency_study" >> /home/ec2-user/app/app.env
+          echo "MYSQL_USERNAME=admin" >> /home/ec2-user/app/app.env
+          echo "MYSQL_PASSWORD=${DBMasterPassword}" >> /home/ec2-user/app/app.env
+          echo "REDIS_HOST=${RedisCluster.RedisEndpoint.Address}" >> /home/ec2-user/app/app.env
+          echo "REDIS_PORT=6379" >> /home/ec2-user/app/app.env
+          chown -R ec2-user:ec2-user /home/ec2-user/app
+
+  EC2Instance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: concurrency-study-app-2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y docker git java-21-amazon-corretto-headless mariadb105
+          systemctl enable docker
+          systemctl start docker
+          usermod -a -G docker ec2-user
+
+          mkdir -p /home/ec2-user/app
+          echo "SPRING_PROFILES_ACTIVE=local" > /home/ec2-user/app/app.env
+          echo "MYSQL_HOST=${RDSInstance.Endpoint.Address}" >> /home/ec2-user/app/app.env
+          echo "MYSQL_PORT=3306" >> /home/ec2-user/app/app.env
+          echo "MYSQL_DATABASE=concurrency_study" >> /home/ec2-user/app/app.env
+          echo "MYSQL_USERNAME=admin" >> /home/ec2-user/app/app.env
+          echo "MYSQL_PASSWORD=${DBMasterPassword}" >> /home/ec2-user/app/app.env
+          echo "REDIS_HOST=${RedisCluster.RedisEndpoint.Address}" >> /home/ec2-user/app/app.env
+          echo "REDIS_PORT=6379" >> /home/ec2-user/app/app.env
+          chown -R ec2-user:ec2-user /home/ec2-user/app
+
+  # ======================== RDS MySQL ========================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Concurrency Study DB Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: concurrency-study-db-subnet-group
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: concurrency-study-mysql
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBName: concurrency_study
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 0
+      Tags:
+        - Key: Name
+          Value: concurrency-study-rds
+
+  # ======================== ElastiCache Redis ========================
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Concurrency Study Cache Subnet Group
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: concurrency-study-redis
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt RedisSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: concurrency-study-redis
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  ALBDNSName:
+    Description: ALB DNS Name (API 엔드포인트)
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  EC2Instance1PublicIP:
+    Description: EC2 #1 Public IP (SSH 접속)
+    Value: !GetAtt EC2Instance1.PublicIp
+
+  EC2Instance2PublicIP:
+    Description: EC2 #2 Public IP (SSH 접속)
+    Value: !GetAtt EC2Instance2.PublicIp
+
+  RDSEndpoint:
+    Description: RDS MySQL 엔드포인트
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  RedisEndpoint:
+    Description: ElastiCache Redis 엔드포인트
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+
+  SSHCommand1:
+    Description: EC2 #1 SSH 접속 명령어
+    Value: !Sub "ssh -i ${KeyPairName}.pem ec2-user@${EC2Instance1.PublicIp}"
+
+  SSHCommand2:
+    Description: EC2 #2 SSH 접속 명령어
+    Value: !Sub "ssh -i ${KeyPairName}.pem ec2-user@${EC2Instance2.PublicIp}"

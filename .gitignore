@@ -44,3 +44,7 @@ bin/
 
 ### Env ###
 .env
+
+### AWS 접속 정보 (별도 전달) ###
+docs/guides/
+scripts/deploy.sh
