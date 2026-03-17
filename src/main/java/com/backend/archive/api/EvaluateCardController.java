@@ -2,6 +2,7 @@ package com.backend.archive.api;
 
 import com.backend.archive.api.dto.EvaluateCardRequest;
 import com.backend.archive.api.dto.NewbieCardResponse;
+import com.backend.archive.idempotency.Idempotent;
 import com.backend.archive.service.EvaluateCardService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +25,7 @@ public class EvaluateCardController {
     }
 
     @PostMapping
+    @Idempotent(ttlMillis = 500)
     public ResponseEntity<?> getNewbie(@RequestBody EvaluateCardRequest request) {
         log.info(
             "[API] POST /card/newbie evalUserNo={}",

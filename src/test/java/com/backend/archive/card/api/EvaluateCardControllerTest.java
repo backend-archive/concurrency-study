@@ -14,6 +14,8 @@ import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.util.UUID;
+
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -45,6 +47,7 @@ class EvaluateCardControllerTest {
             """;
 
         MvcResult first = mockMvc.perform(post("/card/newbie")
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(requestBody))
             .andExpect(status().isOk())
@@ -60,6 +63,7 @@ class EvaluateCardControllerTest {
         jdbcTemplate.update("DELETE FROM NEWBIE_CANDIDATE WHERE USER_NO = ?", 2002L);
 
         MvcResult second = mockMvc.perform(post("/card/newbie")
+                .header("Idempotency-Key", UUID.randomUUID().toString())
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(requestBody))
             .andExpect(status().isOk())
