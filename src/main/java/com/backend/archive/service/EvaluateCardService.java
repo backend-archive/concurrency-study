@@ -9,6 +9,7 @@ import com.backend.archive.querydsl.NewbieEvalHistDsl;
 import com.backend.archive.repository.NewbieEvalHistRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.backend.archive.annotation.DuplicateRequestLock;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -39,6 +40,7 @@ public class EvaluateCardService {
         this.newbieCandidateDsl = newbieCandidateDsl;
     }
 
+    @DuplicateRequestLock(prefix = "eval-lock", key = "#request.evalUserNo", ttlSeconds = 3)
     @Transactional
     public NewbieCardResponse getNewBieCard(EvaluateCardRequest request) {
         validate(request);

@@ -55,6 +55,8 @@ spring:
   config:
     activate:
       on-profile: test
+  main:
+    allow-bean-definition-overriding: true
   datasource:
     url: jdbc:h2:mem:concurrency-study;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_UPPER=false
     driver-class-name: org.h2.Driver
@@ -62,10 +64,8 @@ spring:
     password:
   data:
     redis:
-      repositories:
-        enabled: false
       host: localhost
-      port: 6379
+      port: 16379
   jpa:
     hibernate:
       ddl-auto: create-drop
