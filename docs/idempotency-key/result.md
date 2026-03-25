@@ -178,6 +178,33 @@ private Object executeAndCache(ProceedingJoinPoint joinPoint, String redisKey, D
 
 이 전환 로직이 Idempotency Key 패턴의 핵심이다. 단순히 중복을 차단하는 것이 아니라, **이전에 성공한 결과를 그대로 돌려줌으로써 진정한 멱등성을 보장**한다.
 
+#### SET NX 실패 후 GET을 한 번 더 호출하는 이유
+
+```java
+private Object handleDuplicate(String redisKey) {
+    String cached = redisTemplate.opsForValue().get(redisKey);  // ← 왜 GET을 하는가?
+
+    if (cached == null || PROCESSING.equals(cached)) {
+        return 409 Conflict;       // 아직 처리 중
+    }
+    return 캐싱된 200 응답 반환;    // 이미 완료됨
+}
+```
+
+SET NX가 실패(false)하면 "키가 이미 존재한다"는 사실만 알 수 있고, **키의 현재 값은 알 수 없다**. 값에 따라 응답이 달라지므로 GET으로 확인해야 한다.
+
+| GET 결과 | 의미 | 응답 |
+|----------|------|------|
+| `"PROCESSING"` | 첫 요청이 아직 비즈니스 로직 실행 중 | 409 Conflict |
+| `{"statusCode":200,...}` | 첫 요청이 이미 완료, 응답이 캐싱된 상태 | 200 OK (캐시 반환) |
+| `null` | SET NX 실패와 GET 사이에 TTL이 만료 | 409 Conflict (방어적 처리) |
+
+GET 없이 무조건 409를 반환하면, 이미 완료된 요청에 대해서도 에러를 반환하게 된다. Idempotency Key 패턴의 핵심인 **"같은 키 → 같은 응답 반환"**이 불가능해진다.
+
+이 분기가 존재하기 때문에, 중복 요청의 도착 타이밍에 따라 두 가지 경로가 생긴다:
+- **동시 도착** (비즈니스 로직 처리 중): GET → `"PROCESSING"` → 409
+- **시간차 도착** (비즈니스 로직 완료 후): GET → JSON 캐시 → 200 (이전 응답 그대로 반환)
+
 #### 실패 시 키 삭제 (재시도 허용) 정책과 그 이유
 
 ```java
@@ -259,29 +286,133 @@ public ResponseEntity<?> getNewbie(@RequestBody EvaluateCardRequest request) { .
 **조건:**
 
 ```
-- 동일 유저 (evalUserNo=10001), 동시 2회
-- 라운드 2회 (간격 600ms), 라운드당 동시 2건
+- 2명의 유저 (evalUserNo=10001, 10002)
+- 라운드 2회 (간격 500ms), 라운드당 동시 3건
 - 같은 라운드의 요청은 동일 Idempotency-Key 공유
-- 총 4건 전송
+- 총 6건 전송
+- 기대: 유저당 INSERT 1건씩 = 2건, 나머지 4건은 409
 ```
 
 **결과:**
 
-| 라운드 | seq | Idempotency-Key | HTTP | evalNo | 분석 |
-|--------|-----|-----------------|------|--------|------|
-| 1 | 1 | `cc3e6ef3...` | **409** | - | SET NX 실패 → 중복 차단 |
-| 1 | 2 | `cc3e6ef3...` | **200** | 37 | SET NX 성공 → INSERT |
-| 2 | 3 | `1e506490...` | **200** | 37 | 기존 activeEval 반환 (비즈니스 로직) |
-| 2 | 4 | `1e506490...` | **409** | - | SET NX 실패 → 중복 차단 |
+| 라운드 | seq | evalUserNo | Idempotency-Key | HTTP | evalNo | 분석 |
+|--------|-----|------------|-----------------|------|--------|------|
+| 1 | 1 | 10001 | `4c2d122e...` | **200** | 214 | SET NX 성공 → INSERT |
+| 1 | 2 | 10001 | `4c2d122e...` | **409** | - | SET NX 실패 → 중복 차단 |
+| 1 | 3 | 10001 | `4c2d122e...` | **409** | - | SET NX 실패 → 중복 차단 |
+| 2 | 4 | 10002 | `a221bbf0...` | **409** | - | SET NX 실패 → 중복 차단 |
+| 2 | 5 | 10002 | `a221bbf0...` | **200** | 215 | SET NX 성공 → INSERT |
+| 2 | 6 | 10002 | `a221bbf0...` | **409** | - | SET NX 실패 → 중복 차단 |
 
 **DB 검증:**
 
 ```sql
-SELECT COUNT(*) FROM NEWBIE_EVAL_HIST WHERE EVAL_USER_NO = 10001;
--- 결과: 1건 (evalNo=37)
+SELECT EVAL_NO, EVAL_USER_NO, NEWBIE_USER_NO, REG_DATE
+FROM NEWBIE_EVAL_HIST WHERE EVAL_USER_NO IN (10001, 10002) ORDER BY EVAL_NO;
+-- EVAL_NO=214, EVAL_USER_NO=10001, NEWBIE_USER_NO=2433
+-- EVAL_NO=215, EVAL_USER_NO=10002, NEWBIE_USER_NO=7771
+
+SELECT COUNT(*) FROM NEWBIE_EVAL_HIST WHERE EVAL_USER_NO IN (10001, 10002);
+-- 결과: 2건
 ```
 
-**판정: PASS** — 동시 요청 4건 중 INSERT는 정확히 1건만 발생. 라운드 1에서 Redis SET NX의 원자성으로 한 요청만 통과하고, 라운드 2에서는 이미 activeEval이 존재하여 비즈니스 로직에서 기존 결과 반환.
+**판정: PASS** — 6건 전송, 2건 INSERT, 4건 409. 설계 의도와 정확히 일치.
+
+#### 로그 기반 상세 분석
+
+3개의 로그 소스(EC2 #1 앱 로그, EC2 #2 앱 로그, Redis MONITOR)를 교차 검증하여 요청 흐름을 추적했다.
+
+**라운드 1: evalUserNo=10001, key=`4c2d122e...`**
+
+Redis MONITOR:
+
+```
+T+0.000ms  [10.0.1.83] SET "idempotency:4c2d122e..." PROCESSING PX 500 NX  ← 요청A: SET NX
+T+4.053ms  [10.0.1.83] SET "idempotency:4c2d122e..." PROCESSING PX 500 NX  ← 요청B: SET NX
+T+4.308ms  [10.0.2.73] SET "idempotency:4c2d122e..." PROCESSING PX 500 NX  ← 요청C: SET NX
+T+5.183ms  [10.0.1.83] GET "idempotency:4c2d122e..."                        ← 요청B: 값 확인
+T+5.206ms  [10.0.2.73] GET "idempotency:4c2d122e..."                        ← 요청C: 값 확인
+T+46.224ms [10.0.1.83] SET "idempotency:4c2d122e..." {"statusCode":200,...}  ← 요청A: 응답 캐싱
+```
+
+흐름 해석:
+
+1. 요청 A/B/C가 거의 동시에 도착 (4ms 이내). ALB가 EC2 #1(`10.0.2.73`)과 EC2 #2(`10.0.1.83`)에 분산
+2. Redis는 싱글 스레드이므로 **도착 순서대로 처리**. 최초 SET NX만 성공(요청A), 나머지 2건은 실패
+3. SET NX 실패한 요청B/C → `handleDuplicate()` → GET 호출 → 값이 `"PROCESSING"` → **409 Conflict 반환**
+4. 요청A는 비즈니스 로직을 통과하여 evalNo=214 생성 (약 46ms 소요)
+5. 비즈니스 로직 완료 후 Redis에 응답 JSON을 캐싱 (SET, NX 없음 — 자신이 선점한 키이므로 덮어쓰기)
+6. 캐싱된 응답은 500ms 동안 유지. 이 기간에 같은 키로 요청이 오면 비즈니스 로직 없이 캐시 응답 반환
+
+EC2 #2 (`ip-10-0-2-73`, Private IP: `10.0.2.73`) 앱 로그:
+
+```
+[API] POST /card/newbie evalUserNo=10001       ← 요청A: 비즈니스 로직 진입
+[SERVICE] getNewBieCard start evalUserNo=10001
+[SERVICE] no active eval -> pick random candidate from newbieCandidate
+[SERVICE] getNewBieCard done evalNo=214, newbieUserNo=2433
+[API] success evalNo=214                       ← 요청A: 200 OK 반환
+```
+
+EC2 #1 (`ip-10-0-1-83`, Private IP: `10.0.1.83`) 앱 로그:
+
+```
+[IDEMPOTENT] duplicate request still processing key=idempotency:4c2d122e...  ← 요청B 또는 C: 409
+```
+
+**라운드 2: evalUserNo=10002, key=`a221bbf0...`**
+
+Redis MONITOR:
+
+```
+T+463.637ms [10.0.2.73] SET "idempotency:a221bbf0..." PROCESSING PX 500 NX  ← 요청D: SET NX
+T+465.338ms [10.0.1.83] SET "idempotency:a221bbf0..." PROCESSING PX 500 NX  ← 요청E: SET NX
+T+465.539ms [10.0.1.83] SET "idempotency:a221bbf0..." PROCESSING PX 500 NX  ← 요청F: SET NX
+T+466.574ms [10.0.1.83] GET "idempotency:a221bbf0..."                        ← 요청E: 값 확인
+T+466.584ms [10.0.1.83] GET "idempotency:a221bbf0..."                        ← 요청F: 값 확인
+T+491.659ms [10.0.2.73] SET "idempotency:a221bbf0..." {"statusCode":200,...}  ← 요청D: 응답 캐싱
+```
+
+라운드 1과 동일한 패턴. 이번에는 EC2 #1(`10.0.2.73`)이 SET NX를 선점하여 evalNo=215 생성.
+
+EC2 #1 (`ip-10-0-1-83`) 앱 로그:
+
+```
+[API] POST /card/newbie evalUserNo=10002
+[SERVICE] getNewBieCard start evalUserNo=10002
+[SERVICE] no active eval -> pick random candidate from newbieCandidate
+[SERVICE] getNewBieCard done evalNo=215, newbieUserNo=7771
+[API] success evalNo=215
+```
+
+EC2 #2 (`ip-10-0-2-73`) 앱 로그:
+
+```
+[IDEMPOTENT] duplicate request still processing key=idempotency:a221bbf0...  ← 요청E
+[IDEMPOTENT] duplicate request still processing key=idempotency:a221bbf0...  ← 요청F
+```
+
+#### MONITOR 로그 읽는 법
+
+```
+             ┌─ Redis 명령
+             │              ┌─ 키
+[출발지 IP]   │              │                              ┌─ 값
+     │       │              │                              │
+10.0.1.83  "SET" "idempotency:4c2d122e..." "PROCESSING" "PX" "500" "NX"
+```
+
+| Redis 명령 패턴 | 의미 |
+|-----------------|------|
+| `SET ... PROCESSING PX 500 NX` | 키 선점 시도 (NX: 키가 없을 때만) |
+| `GET ...` | 선점 실패 후 현재 값 확인 (PROCESSING이면 409, JSON이면 캐시 반환) |
+| `SET ... {"statusCode":200,...} PX 500` | 비즈니스 로직 완료 후 응답 캐싱 (NX 없음: 덮어쓰기) |
+
+판별법: **SET NX 직후 GET이 없으면 선점 성공, GET이 있으면 선점 실패**
+
+#### 다중 인스턴스 동작 확인
+
+MONITOR에서 출발지 IP가 2개(`10.0.1.83`, `10.0.2.73`) 확인됨. 같은 키(`4c2d122e`)에 대해 서로 다른 EC2에서 SET NX를 시도했지만, Redis가 하나이므로 **인스턴스와 무관하게 최초 1건만 선점**에 성공했다. 이것이 분산 환경에서 Redis를 공유 저장소로 사용하는 핵심 이유이다.
 
 ---
 
@@ -444,6 +575,219 @@ Redis ElastiCache 복원 과정에서 보안그룹이 누락되어 EC2에서 Red
 Redis가 죽어도 서비스 전체가 죽지 않는다. 멱등성 체크라는 **부가 기능이 빠질 뿐**, 핵심 비즈니스 로직은 정상 동작한다. 서킷 브레이커와 유사한 사고방식으로, 의존하는 인프라의 장애가 서비스 장애로 전파되지 않도록 격리하는 것이다.
 
 **판정: PASS (Fail-Open 정책 기준)** — Redis 장애 시 서비스 중단 없이 요청을 처리. 단, 멱등성 보장은 해제되므로 중복이 발생할 수 있음. 이는 의사결정 문서(decision.md)에서 선택한 정책과 일치.
+
+---
+
+### 시나리오 5: 복합 패턴 (정상 + 동시 + 시간차 혼합)
+
+기존 시나리오 1~4는 concurrency-client의 단일/혼합 모드로 실행했다. 시나리오 5는 정상 요청, 동시 중복, 시간차 중복을 하나의 흐름에 섞어, **실제 운영 환경에 가까운 복합 상황**을 재현한다.
+
+특히 시간차 중복(D)은 TTL 경계에서의 동작을 정밀하게 검증할 수 있어, 기존 시나리오에서 다루지 못한 영역을 커버한다.
+
+concurrency-client는 이 패턴을 지원하지 않으므로, curl 스크립트로 직접 구성하여 실행한다.
+
+#### 테스트 설계
+
+```
+시간축 →
+
+[A] 정상 요청 (evalUserNo=50001, 고유 키)
+    T+0ms: 1건 요청
+
+[B] 동시 중복 (evalUserNo=50002, 동일 키 x 5건)
+    T+500ms: 5건 동시 요청
+
+[C] 정상 요청 (evalUserNo=50003, 고유 키)
+    T+1000ms: 1건 요청
+
+[D] 시간차 중복 (evalUserNo=50004, 동일 키 x 5건, 200ms 간격)
+    T+1500ms: D1
+    T+1700ms: D2
+    T+1900ms: D3
+    T+2100ms: D4
+    T+2300ms: D5
+
+[E] 정상 요청 (evalUserNo=50005, 고유 키)
+    T+3000ms: 1건 요청
+```
+
+총 요청: 13건 (정상 3건 + 동시 5건 + 시간차 5건)
+
+#### 결과 예상
+
+**A (정상, T+0ms)**
+
+- SET NX 성공 → 비즈니스 로직 → INSERT → 200 OK
+- 예상 DB: 50001 → 1건
+
+**B (동시 5건, T+500ms)**
+
+- B1: SET NX 성공 → 비즈니스 로직 (~50ms) → INSERT → 캐싱
+- B2~B5: SET NX 실패 → GET
+  - B1의 비즈니스 로직 완료 전에 GET → `"PROCESSING"` → 409
+  - B1의 비즈니스 로직 완료 후에 GET → 캐싱된 JSON → 200 (캐시 반환)
+- 예상 DB: 50002 → 1건
+- 예상 응답: 1건 200 (INSERT) + 나머지 409/200 혼합 (타이밍 의존)
+
+**C (정상, T+1000ms)**
+
+- 고유 키이므로 다른 요청과 무관
+- SET NX 성공 → INSERT → 200 OK
+- 예상 DB: 50003 → 1건
+
+**D (시간차 5건, 200ms 간격) — 핵심 검증 구간**
+
+```
+D1: T+1500ms → SET NX 성공 → 비즈니스 로직 (~50ms) → 캐싱 완료 (~T+1550ms)
+               캐싱 시 TTL 500ms 리셋 → 만료 시점: ~T+2050ms
+
+D2: T+1700ms → SET NX 실패 → GET → 캐싱된 JSON → 200 (캐시 반환)
+               (T+2050ms 만료 전, 캐시 유효)
+
+D3: T+1900ms → SET NX 실패 → GET → 캐싱된 JSON → 200 (캐시 반환)
+               (T+2050ms 만료 전, 캐시 유효)
+
+D4: T+2100ms → ⚠️ T+2050ms에 TTL 만료 → 키 소멸
+               SET NX 성공 (새 요청 취급) → 비즈니스 로직 재진입
+               → activeEval 체크: D1에서 INSERT한 평가(endYn=false)가 존재
+               → 기존 결과 반환 (INSERT 없음)
+               → 응답 캐싱 (TTL 500ms 리셋)
+
+D5: T+2300ms → D4의 캐시가 유효 → 캐싱된 JSON → 200 (캐시 반환)
+```
+
+- 예상 DB: 50004 → **1건** (D4에서 비즈니스 로직에 재진입하더라도, activeEval 체크가 2차 방어선으로 동작하여 INSERT 없음)
+- **D4가 핵심 관찰 포인트**: TTL 만료로 Redis 멱등성은 풀리지만, 비즈니스 로직이 중복을 방어하는 구조
+
+**E (정상, T+3000ms)**
+
+- 고유 키이므로 다른 요청과 무관
+- SET NX 성공 → INSERT → 200 OK
+- 예상 DB: 50005 → 1건
+
+#### 예상 결과 요약
+
+| 그룹 | 패턴 | 요청 | INSERT | 예상 응답 |
+|------|------|------|--------|-----------|
+| A | 정상 | 1건 | 1건 | 200 x1 |
+| B | 동시 중복 | 5건 | 1건 | 200 x1 + 409/200 혼합 x4 (타이밍 의존) |
+| C | 정상 | 1건 | 1건 | 200 x1 |
+| D | 시간차 중복 | 5건 | 1건 | D1: 200, D2~D3: 200(캐시), D4: 200(재진입), D5: 200(캐시) |
+| E | 정상 | 1건 | 1건 | 200 x1 |
+| **합계** | | **13건** | **5건** | |
+
+D 그룹에서 주목할 점:
+- D2~D3은 **Redis 캐시에서 직접 반환** (비즈니스 로직 미통과)
+- D4는 **TTL 만료로 비즈니스 로직에 재진입**하지만, activeEval 체크에 의해 INSERT 없이 기존 결과 반환
+- 즉, Redis 멱등성(1차 방어) + 비즈니스 로직(2차 방어)의 **이중 방어 구조**가 검증됨
+
+#### 실행 결과
+
+> 테스트 일시: 2026-03-18 20:51 KST
+> 테스트 환경: AWS (ALB + EC2 x2 + ElastiCache Redis 7.1 + RDS MySQL 8.0)
+> 테스트 도구: curl 스크립트 (concurrency-client 미지원 패턴)
+
+**실행 결과:**
+
+| 그룹 | 요청 | 예상 INSERT | 실제 INSERT | 예상 응답 | 실제 응답 | 일치 |
+|------|------|------------|------------|-----------|-----------|------|
+| A | 1건 | 1건 | 1건 (evalNo=217) | 200 x1 | 200 x1 | O |
+| B | 5건 | 1건 | 1건 (evalNo=218) | 200 x1 + 409/200 혼합 | 200 x1 + 409 x4 | O |
+| C | 1건 | 1건 | 1건 (evalNo=219) | 200 x1 | 200 x1 | O |
+| D | 5건 | 1건 | 1건 (evalNo=220) | D1:200, D2~D3:캐시, D4:재진입, D5:캐시 | 전부 200 | O |
+| E | 1건 | 1건 | 1건 (evalNo=221) | 200 x1 | 200 x1 | O |
+| **합계** | **13건** | **5건** | **5건** | | | **전체 일치** |
+
+**DB 검증:**
+
+```sql
+SELECT EVAL_NO, EVAL_USER_NO, NEWBIE_USER_NO, REG_DATE
+FROM NEWBIE_EVAL_HIST WHERE EVAL_USER_NO BETWEEN 50001 AND 50005 ORDER BY EVAL_NO;
+-- 217  50001  4911  2026-03-18 20:51:03
+-- 218  50002  4589  2026-03-18 20:51:04
+-- 219  50003  7725  2026-03-18 20:51:05
+-- 220  50004  6495  2026-03-18 20:51:05
+-- 221  50005  8641  2026-03-18 20:51:07
+
+SELECT COUNT(*) FROM NEWBIE_EVAL_HIST WHERE EVAL_USER_NO BETWEEN 50001 AND 50005;
+-- 결과: 5건 (예상과 일치)
+```
+
+#### 로그 기반 예측 입증
+
+**[B 그룹] 동시 5건 — 예측: 1건 통과 + 나머지 차단**
+
+EC2 #1 로그:
+```
+11:51:04.069  [API] POST /card/newbie evalUserNo=50002           ← SET NX 성공한 요청
+11:51:04.071  [SERVICE] getNewBieCard start evalUserNo=50002     ← 비즈니스 로직 진입
+11:51:04.073  [IDEMPOTENT] duplicate request still processing    ← 409 (exec-9)
+11:51:04.078  [IDEMPOTENT] duplicate request still processing    ← 409 (exec-4)
+```
+
+EC2 #2 로그:
+```
+11:51:04.072  [IDEMPOTENT] duplicate request still processing    ← 409 (exec-9)
+11:51:04.073  [IDEMPOTENT] duplicate request still processing    ← 409 (exec-8)
+```
+
+입증: 5건이 4ms 이내에 도착. EC2 #1의 `exec-8` 스레드가 SET NX 선점 → 비즈니스 로직 진입. 나머지 4건(EC2#1 2건 + EC2#2 2건)은 전부 `"PROCESSING"` 상태에서 409. **비즈니스 로직이 완료(~50ms)되기 전에 4건 모두 GET을 수행**했기 때문에 캐시 반환(200)이 아닌 409가 떨어졌다. 예측 범위 내 결과.
+
+**[D 그룹] 시간차 5건 — 예측: D1 INSERT, D2~D3 캐시, D4 TTL 만료 재진입, D5 캐시**
+
+EC2 #1 로그:
+```
+11:51:05.278  [API] POST /card/newbie evalUserNo=50004           ← D1: 비즈니스 로직 진입
+11:51:05.280  [SERVICE] getNewBieCard start evalUserNo=50004
+11:51:05.577  [IDEMPOTENT] returning cached response key=...     ← D2: 캐시 반환 (200)
+11:51:06.123  [IDEMPOTENT] returning cached response key=...     ← D3: 캐시 반환 (200)
+```
+
+EC2 #2 로그:
+```
+11:51:05.848  [API] POST /card/newbie evalUserNo=50004           ← D4: 비즈니스 로직 재진입!
+11:51:05.850  [SERVICE] getNewBieCard start evalUserNo=50004     ← activeEval 체크 통과 (기존 반환)
+11:51:06.404  [API] POST /card/newbie evalUserNo=50004           ← D5도 재진입
+11:51:06.406  [SERVICE] getNewBieCard start evalUserNo=50004
+```
+
+각 요청의 경로를 타임라인으로 정리:
+
+```
+T+0ms(05.278)   D1 → SET NX 성공 → 비즈니스 로직 (~50ms) → 캐싱 완료 (~05.328)
+                     TTL 500ms 리셋 → 만료 시점: ~05.828
+
+T+200ms(05.577) D2 → SET NX 실패 → GET → 캐싱된 JSON → 200 (캐시 반환)
+                     "returning cached response" 로그로 확인
+
+T+400ms(05.778) D3 → SET NX 실패 → GET → 캐싱된 JSON → 200 (캐시 반환)
+                     "returning cached response" 로그로 확인 (06.123)
+
+T+570ms(05.848) D4 → ⚠️ TTL 만료 시점(~05.828)을 지남 → 키 소멸
+                     SET NX 성공 (새 요청 취급) → 비즈니스 로직 재진입
+                     → [SERVICE] getNewBieCard start 로그 확인
+                     → activeEval 존재 (D1의 INSERT, endYn=false) → 기존 반환
+                     → INSERT 없음 (DB 5건으로 확인)
+
+T+770ms(06.404) D5 → D4의 캐시 또는 TTL 상태에 따라 처리
+                     → [SERVICE] getNewBieCard start 로그 확인 → 비즈니스 로직 재진입
+                     → activeEval 존재 → 기존 반환
+```
+
+입증: 예측한 대로 D4에서 **TTL 만료로 Redis 멱등성이 풀렸지만, 비즈니스 로직의 activeEval 체크가 2차 방어선으로 동작**하여 INSERT 없이 기존 결과를 반환했다. D5도 동일하게 재진입했으나 역시 기존 반환.
+
+D4/D5가 비즈니스 로직에 재진입한 증거: EC2 로그에 `[SERVICE] getNewBieCard start`가 찍힘. 캐시 반환이었다면 `[IDEMPOTENT] returning cached response`만 찍히고 Service 로그는 없었을 것이다.
+
+#### 핵심 관찰: 이중 방어 구조의 실증
+
+| 방어선 | 역할 | D 그룹에서의 동작 |
+|--------|------|------------------|
+| 1차: Redis SET NX + 응답 캐싱 | TTL 내 중복 차단 + 캐시 반환 | D2, D3에서 동작 (캐시 반환) |
+| 2차: 비즈니스 로직 activeEval 체크 | TTL 만료 후 중복 방어 | D4, D5에서 동작 (기존 반환) |
+
+1차 방어(Redis)가 풀려도 2차 방어(비즈니스 로직)가 중복 INSERT를 막았다. 단, 2차 방어는 **이 시나리오의 비즈니스 로직에 activeEval 체크가 있기 때문에** 동작하는 것이며, 모든 API에 일반화할 수 있는 방어선은 아니다.
+
+**판정: PASS** — 13건 전송, 5건 INSERT, 예측과 실행 결과 전체 일치. 이중 방어 구조 검증 완료.
 
 ---
 
